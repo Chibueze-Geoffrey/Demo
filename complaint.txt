@@ -1,0 +1,905 @@
+using AutoMapper;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Logging;
+using Polaris.Digital.ComplaintService.Business.KafkaService;
+using Polaris.Digital.ComplaintService.Business.Logic.Interfaces;
+using Polaris.Digital.ComplaintService.Common.DTO.Requests;
+using Polaris.Digital.ComplaintService.Common.DTO.Responses;
+using Polaris.Digital.ComplaintService.Data.Entities;
+using Polaris.Digital.ComplaintService.Data.Enums;
+using Polaris.Digital.ComplaintService.Data.Repository;
+using Polaris.Digital.ComplaintService.Data.UnitOfWorks;
+using System;
+using System.Collections.Generic;
+using System.Collections.ObjectModel;
+using System.IO;
+using System.Linq;
+using System.Threading.Tasks;
+
+namespace Polaris.Digital.ComplaintService.Business.Logic.Implementation
+{
+    public class RequestService : IRequestService
+    {
+        private readonly IMapper _mapper;
+        private readonly IRepository<Topic> _topicRepo;
+        private readonly IRepository<Request> _requestRepo;
+        private readonly IRepository<RequestType> _requestTypeRepo;
+        private readonly IRepository<SubRequestType> _subRequestTypeRepo;
+        private readonly IUnitOfWork unitOfWork;
+        private readonly string[] permittedExtensions = { ".png", ".jpeg", ".jpg", ".pdf" };
+        private readonly AppSettings _appSettings;
+        private readonly IProducer _producer;
+        private readonly INotificationService _notificationService;
+
+        public ILogger<RequestService> Logger { get; }
+
+        public RequestService(ILogger<RequestService> logger, IMapper mapper, IRepository<Topic> topicRepo, IRepository<Request> requestRepo, IRepository<RequestType> requestTypeRepo, AppSettings appSettings, IProducer producer, IUnitOfWork uow,
+            IRepository<SubRequestType> subRequestTypeRepo, INotificationService notificationService)
+        {
+            Logger = logger;
+            _mapper = mapper;
+            _topicRepo = topicRepo;
+            _requestRepo = requestRepo;
+            _requestTypeRepo = requestTypeRepo;
+            _appSettings = appSettings;
+            unitOfWork = uow;
+            _producer = producer;
+            _subRequestTypeRepo = subRequestTypeRepo;
+            _notificationService = notificationService;
+        }
+        public ApiResponse<List<RequestTypeVM>> GetRequestTypes()
+        {
+            var er = new ApiResponse<List<RequestTypeVM>>();
+
+            try
+            {
+                Logger.LogInformation("Starting GetRequestTypes method.");
+
+                // Log repository fetch attempt
+                Logger.LogInformation("Attempting to fetch active request types from the repository, excluding 'Complaint' and 'Enquiry'.");
+
+                var res = _requestTypeRepo.GetAll(x => x.IsActive && x.Name != "Complaint" && x.Name != "Enquiry")
+                                 .Select(x => new RequestType
+                                 {
+                                     //Id = Guid.Parse(x.Id), // Ensure proper type conversion
+                                     Id = x.Id,
+                                     Name = x.Name,
+                                     Description = x.Description,
+                                     IsActive = x.IsActive
+                                 })
+                                 .OrderBy(x => x.Name)
+                                 .ToList();
+
+                Logger.LogInformation("Fetched {Count} request types from the repository.", res?.Count ?? 0);
+
+                // Check for empty results
+                if (res == null || !res.Any())
+                {
+                    Logger.LogWarning("No active request types found. Repository result: {@RepositoryResult}", res);
+                    return ApiResponse<List<RequestTypeVM>>.Failed("Request types not found");
+                }
+
+                // Log mapping attempt
+                Logger.LogInformation("Attempting to map fetched request types to RequestTypeVM.");
+
+                // Mapping to RequestTypeVM
+                er.Result = _mapper.Map<List<RequestTypeVM>>(res);
+
+                // Log mapping result
+                Logger.LogInformation("Mapped {Count} request types to RequestTypeVM successfully. Mapped Result: {@MappedResult}", er.Result?.Count ?? 0, er.Result);
+            }
+            catch (ArgumentNullException argEx)
+            {
+                Logger.LogError(argEx, "Null argument exception while processing request types. Details: {@ExceptionData}", argEx);
+                er.Response = ApiResponseCodes.ProcessingError;
+                er.Message = "A required argument was null. Please check the configuration and try again.";
+                return er;
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError(ex, "Unexpected error occurred while getting request types. Exception Details: {@ExceptionData}", ex);
+                er.Response = ApiResponseCodes.ProcessingError;
+                er.Message = "Service error, please try again";
+                return er;
+            }
+
+            Logger.LogInformation("GetRequestTypes method completed successfully with final response: {@Response}", er);
+            return er;
+        }
+
+
+        public async Task<ApiResponse<IEnumerable<RequestType>>> GetRequestTypeGroupedBySubRequestType()
+        {
+            var response = ApiResponse<IEnumerable<RequestType>>.Failed(string.Empty);
+            try
+            {
+                var requestTypeWitSub = _requestTypeRepo.GetAll().Include(rt => rt.SubRequestTypes).ToList(); ;
+                foreach (var item in requestTypeWitSub)
+                {
+                    item.SubRequestTypes = item.SubRequestTypes.OrderBy(x => x.Id).ToList();
+                }
+                response = ApiResponse<IEnumerable<RequestType>>.Success(requestTypeWitSub);
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError(ex, "Error occurred while getting request types and categories", ex);
+                response = ApiResponse<IEnumerable<RequestType>>.Failed(ex.Message);
+            }
+            return await Task.FromResult(response);
+        }
+
+
+        public async Task<ApiResponse<List<TopicResponse>>> GetTopics()
+        {
+            var topics = await _topicRepo.GetByAsync(x => x.IsActive);
+
+            if (topics is null || topics.Count < 1)
+            {
+                return ApiResponse<List<TopicResponse>>.NotFound("No topics found");
+            }
+            var result = new List<TopicResponse>();
+            foreach (var topic in topics)
+            {
+                var respObj = _mapper.Map<TopicResponse>(topic);
+                result.Add(respObj);
+            }
+
+            var r = result.OrderBy(x => x.Topic).ToList();
+
+            Logger.LogInformation("Getting Topics Response Complaint Service {@result}", r);
+
+            return ApiResponse<List<TopicResponse>>.Success(r);
+        }
+        private async Task<string> GenerateUniqueTicketReference()
+        {
+            string reference;
+            bool isUnique;
+
+            do
+            {
+                // Generate a reference with prefix and random digits
+                reference = HelperClass.GenRandomNums(8, "TCK-");
+                isUnique = !(await TicketReferenceExistsAsync(reference));
+            } while (!isUnique);
+
+            return reference;
+        }
+
+        private async Task<bool> TicketReferenceExistsAsync(string reference)
+        {
+            var existingTickets = await _requestRepo.GetByAsync(x => x.TicketReference == reference);
+            return existingTickets.Any();
+        }
+        public async Task<ApiResponse<SubmitMsgResponse>> SubmitMessage(SubmitRequestDomain req)
+        {
+            var response = new SubmitMsgResponse();
+            var senderModel = new NotificationProcessRequest();
+            var yesCenterModel = new NotificationProcessRequest();
+            var receipients = _appSettings.YesCenter.Split(",").ToList();
+            var yesCentreEmail = new List<string>();
+            Logger.LogInformation("ComplaintService:SubmitMessage Complaint Service {@request}", req);
+            var er = new ApiResponse<SubmitMsgResponse>();
+
+            var ext2 = new List<string>();
+            var fSize = new List<long>();
+            try
+            {
+
+                if (req?.Attachments?.Count() > 0)
+                {
+                    if (req.Attachments.Count() > 3)
+                        return ApiResponse<SubmitMsgResponse>.Failed("Maximum attachment is 3. Please try again.");
+
+                    foreach (var file in req.Attachments)
+                    {
+                        if (permittedExtensions.Contains(Path.GetExtension(file.FileName?.ToLowerInvariant())))
+                            ext2.Add(Path.GetExtension(file.FileName)?.ToLowerInvariant());
+
+                        if (file.Length > _appSettings.FileSizeLimit)
+                            fSize.Add(file.Length);
+                    }
+
+                    if (!ext2.Any())
+                        return ApiResponse<SubmitMsgResponse>.Failed("File extension not supported");
+
+                    if (fSize?.Count() > 0)
+                        return ApiResponse<SubmitMsgResponse>.Failed("The file is too large (maximum file size is 2MB)");
+                }
+
+                //var topic = await _topicRepo.Get((long)req.TopicId);
+
+                /*if (topic is null)
+                    return ApiResponse<SubmitMsgResponse>.Failed("Topic not found, please try again");*/
+
+                /*if (!topic.IsActive)
+                    return ApiResponse<SubmitMsgResponse>.Failed("Topic not currently available, please try again");*/
+
+
+
+
+                if (req.SupportType == SupportType.AccountRelatedIssues)
+                {
+                    if (string.IsNullOrEmpty(req.Location))
+                        return ApiResponse<SubmitMsgResponse>.Failed("Location Field is required");
+
+
+                    var reqType = _subRequestTypeRepo.GetFirstOrDefault(x => x.RequestTypeId == req.RequestTypeId);
+                    var subRequestType = _subRequestTypeRepo.GetFirstOrDefault(x => x.Id == req.SubRequestTypeId);
+
+                    if (reqType == null)
+                        return ApiResponse<SubmitMsgResponse>.Failed("Request type not found, please try again.");
+
+                    if (!reqType.IsActive)
+                        return ApiResponse<SubmitMsgResponse>.Failed("Request type not currently active, please try again.");
+
+                    string reference = await GenerateUniqueTicketReference();
+                    var message = new Message { Sender = req.Email, Title = reqType.Name, MessageBody = req.Message };
+                    var collection = new Collection<Message>
+                {
+                    message
+                };
+                    var ticket = _mapper.Map<Request>(req);
+                    //ticket.Topic = reqType.Name;
+                    ticket.Type = reqType.RequestType;
+                    ticket.Status = RequestStatus.Open;
+                    ticket.TicketReference = reference;
+                    ticket.Location = req.Location;
+                    ticket.Amount = req.Amount;
+                    ticket.TransactionDate = req.TransactionDate;
+                    ticket.BeneficiaryBank = req?.BeneficiaryBank;
+                    ticket.AccountNumber = req?.AccountNumber;
+                    ticket.MobileNetwork = req?.MobileNetwork;
+                    ticket.BeneficiaryPhoneNumber = req?.BeneficiaryPhoneNumber;
+                    ticket.BillerType = req?.BillerType;
+                    ticket.MultipleTransactions = req?.MultipleTransactions;
+                    ticket.SubRequestType = subRequestType;
+
+                    ticket.Messages = collection;
+
+                    var newTicket = await _requestRepo.AddAsync(ticket);
+                    await unitOfWork.Complete();
+
+                    response = new SubmitMsgResponse
+                    {
+                        Message = "Ticket created successfully",
+                        SubmittedOn = newTicket.CreatedOn.ToString(),
+                        TicketReference = newTicket.TicketReference
+                    };
+
+                    Logger.LogInformation("SubmitMessage Response Complaint Service {@data}", response);
+
+                    senderModel.CreatedBy = $"{req.LastName} {req.FirstName}";
+                    if (req.Attachments != null)
+                    {
+                        foreach (var file in req.Attachments)
+                        {
+                            var kafkaAttachment = new Base64Attachment
+                            {
+                                FileBase64 = HelperClass.FileToBase64(file),
+                                FileNameWithExtension = file.FileName
+                            };
+                            yesCenterModel.Base64Attachments.Add(kafkaAttachment);
+                        }
+                    }
+
+                    receipients = _appSettings.YesCenter.Split(",").ToList();
+                    yesCentreEmail = new List<string>();
+                    yesCentreEmail.AddRange(receipients);
+
+                    //var yesCentreEmail = new List<string>
+                    //
+                    //    _appSettings.YesCenter
+                    //
+                    yesCenterModel.Recipients = yesCentreEmail;
+
+                    var senderEmail = new List<string>
+                {
+                    req.Email
+                };
+                    senderModel.Recipients = senderEmail;
+
+                    senderModel.Subject = $"Ticket Reference \"{reference}\" : {reqType.Name}";
+                    senderModel.Title = $"<p>Dear {req.FirstName}</P>";
+                    senderModel.TemplateName = _appSettings.EmailTemplate;
+                    senderModel.Type = NotificationType.Email;
+                    senderModel.Message = $"<p>I hope this email finds you well. We appreciate your patience and want to inform you that we have received your reported issue on VULTe.</p><p>A support ticket: <strong>{newTicket.TicketReference}</strong> has been promptly raised, and our dedicated team is actively working to resolve your concern.</p><p>An assigned agent has been notified and will be treating your case with the utmost priority. If you have any further questions or concerns, please feel free to reach out to our Yes Centre team on 07007652747, 08069880000, 014482100, 012705850.</p><p>Email: yescenter@polarisbanklimited.com</p><p>Thank you for choosing VULTe powered by Polaris Bank Limited.</p>";
+
+                    yesCenterModel.Title = "Yes Center";
+                    yesCenterModel.Subject = $"Ticket Reference \"{reference}\" : {reqType.Name}";
+                    yesCenterModel.TemplateName = _appSettings.YesCenterEmailTemplate;
+                    yesCenterModel.Type = NotificationType.Email;
+                    yesCenterModel.Message = $"<b>{reqType.Name} Request</b> received from <b>{req.FirstName} {req.LastName}</b> on {DateTime.Now} with <b>Ticket Reference: <span style=\"color:#0FC25F\">{reference}</span></b>.<p><b>{reqType.Name}</b> : {req.Message}</p><p><b>Contact Details</b></p>Email address: {req.Email}<p>Phone Number: {req.PhoneNumber}</p>";
+
+                    _notificationService.SendMessage(senderModel.Recipients, senderModel.Message, senderModel.Subject, senderModel.Title, senderModel.AccountNumber, NotificationType.Email);
+                    _producer.ProduceToNotification(senderModel);
+                    _producer.ProduceToNotification(yesCenterModel);
+
+
+
+                }
+
+                if (req.SupportType == SupportType.ScamAlertFraudulentTransactions)
+                {
+                    if (string.IsNullOrEmpty(req.Location))
+                        return ApiResponse<SubmitMsgResponse>.Failed("Location Field is required");
+                    if (!req.Amount.HasValue)
+                        return ApiResponse<SubmitMsgResponse>.Failed("Amount field is required");
+                    if (!req.TransactionDate.HasValue)
+                        return ApiResponse<SubmitMsgResponse>.Failed("Transaction date required");
+
+                    var reqType = _subRequestTypeRepo.GetFirstOrDefault(x => x.RequestTypeId == req.RequestTypeId);
+                    var subRequestType = _subRequestTypeRepo.GetFirstOrDefault(x => x.Id == req.SubRequestTypeId);
+
+                    if (reqType == null)
+                        return ApiResponse<SubmitMsgResponse>.Failed("Request type not found, please try again.");
+
+                    if (!reqType.IsActive)
+                        return ApiResponse<SubmitMsgResponse>.Failed("Request type not currently active, please try again.");
+
+                    string reference = await GenerateUniqueTicketReference();
+
+                    var message = new Message { Sender = req.Email, Title = reqType.Name, MessageBody = req.Message };
+                    var collection = new Collection<Message>
+                {
+                    message
+                };
+                    var ticket = _mapper.Map<Request>(req);
+                    //ticket.Topic = reqType.Name;
+                    ticket.Type = reqType.RequestType;
+                    ticket.Status = RequestStatus.Open;
+                    ticket.TicketReference = reference;
+                    ticket.Location = req.Location;
+                    ticket.Amount = req.Amount;
+                    ticket.TransactionDate = req.TransactionDate;
+                    ticket.BeneficiaryBank = req?.BeneficiaryBank;
+                    ticket.AccountNumber = req?.AccountNumber;
+                    ticket.MobileNetwork = req?.MobileNetwork;
+                    ticket.BeneficiaryPhoneNumber = req?.BeneficiaryPhoneNumber;
+                    ticket.BillerType = req?.BillerType;
+                    ticket.MultipleTransactions = req?.MultipleTransactions;
+                    ticket.SubRequestType = subRequestType;
+
+                    ticket.Messages = collection;
+
+                    var newTicket = await _requestRepo.AddAsync(ticket);
+                    await unitOfWork.Complete();
+
+                    response = new SubmitMsgResponse
+                    {
+                        Message = "Ticket created successfully",
+                        SubmittedOn = newTicket.CreatedOn.ToString(),
+                        TicketReference = newTicket.TicketReference
+                    };
+
+                    Logger.LogInformation("SubmitMessage Response Complaint Service {@data}", response);
+
+
+                    senderModel.CreatedBy = $"{req.LastName} {req.FirstName}";
+                    if (req.Attachments != null)
+                    {
+                        foreach (var file in req.Attachments)
+                        {
+                            var kafkaAttachment = new Base64Attachment
+                            {
+                                FileBase64 = HelperClass.FileToBase64(file),
+                                FileNameWithExtension = file.FileName
+                            };
+                            yesCenterModel.Base64Attachments.Add(kafkaAttachment);
+                        }
+                    }
+
+                    receipients = _appSettings.YesCenter.Split(",").ToList();
+                    yesCentreEmail = new List<string>();
+                    yesCentreEmail.AddRange(receipients);
+
+                    //var yesCentreEmail = new List<string>
+                    //
+                    //    _appSettings.YesCenter
+                    //
+                    yesCenterModel.Recipients = yesCentreEmail;
+
+                    var senderEmail = new List<string>
+                {
+                    req.Email
+                };
+                    senderModel.Recipients = senderEmail;
+
+                    senderModel.Subject = $"Ticket Reference \"{reference}\" : {reqType.Name}";
+                    senderModel.Title = $"<p>Dear {req.FirstName}</P>";
+                    senderModel.TemplateName = _appSettings.EmailTemplate;
+                    senderModel.Type = NotificationType.Email;
+                    senderModel.Message = $"<p>I hope this email finds you well. We appreciate your patience and want to inform you that we have received your reported issue on VULTe.</p><p>A support ticket: <strong>{newTicket.TicketReference}</strong> has been promptly raised, and our dedicated team is actively working to resolve your concern.</p><p>An assigned agent has been notified and will be treating your case with the utmost priority. If you have any further questions or concerns, please feel free to reach out to our Yes Centre team on 07007652747, 08069880000, 014482100, 012705850.</p><p>Email: yescenter@polarisbanklimited.com</p><p>Thank you for choosing VULTe powered by Polaris Bank Limited.</p>";
+
+                    yesCenterModel.Title = "Yes Center";
+                    yesCenterModel.Subject = $"Ticket Reference \"{reference}\" : {reqType.Name}";
+                    yesCenterModel.TemplateName = _appSettings.YesCenterEmailTemplate;
+                    yesCenterModel.Type = NotificationType.Email;
+                    yesCenterModel.Message = $"<b>{reqType.Name} Request</b> received from <b>{req.FirstName} {req.LastName}</b> on {DateTime.Now} with <b>Ticket Reference: <span style=\"color:#0FC25F\">{reference}</span></b>.<p><b>{reqType.Name}</b> : {req.Message}</p><p><b>Contact Details</b></p>Email address: {req.Email}<p>Phone Number: {req.PhoneNumber}</p>";
+
+                    _notificationService.SendMessage(senderModel.Recipients, senderModel.Message, senderModel.Subject, senderModel.Title, senderModel.AccountNumber, NotificationType.Email);
+                    _producer.ProduceToNotification(senderModel);
+                    _producer.ProduceToNotification(yesCenterModel);
+
+
+
+                }
+
+                if (req.SupportType == SupportType.ScamAlertBusinessGoneBad)
+                {
+                    if (string.IsNullOrEmpty(req.Location))
+                        return ApiResponse<SubmitMsgResponse>.Failed("Location Field is required");
+                    if (!req.Amount.HasValue)
+                        return ApiResponse<SubmitMsgResponse>.Failed("Amount field is required");
+                    if (!req.TransactionDate.HasValue)
+                        return ApiResponse<SubmitMsgResponse>.Failed("Transaction date required");
+
+                    var reqType = _subRequestTypeRepo.GetFirstOrDefault(x => x.RequestTypeId == req.RequestTypeId);
+                    var subRequestType = _subRequestTypeRepo.GetFirstOrDefault(x => x.Id == req.SubRequestTypeId);
+
+                    if (reqType == null)
+                        return ApiResponse<SubmitMsgResponse>.Failed("Request type not found, please try again.");
+
+                    if (!reqType.IsActive)
+                        return ApiResponse<SubmitMsgResponse>.Failed("Request type not currently active, please try again.");
+
+                    string reference = await GenerateUniqueTicketReference();
+                    var message = new Message { Sender = req.Email, Title = reqType.Name, MessageBody = req.Message };
+                    var collection = new Collection<Message>
+                {
+                    message
+                };
+                    var ticket = _mapper.Map<Request>(req);
+                    //ticket.Topic = reqType.Name;
+                    ticket.Type = reqType.RequestType;
+                    ticket.Status = RequestStatus.Open;
+                    ticket.TicketReference = reference;
+                    ticket.Location = req.Location;
+                    ticket.Amount = req.Amount;
+                    ticket.TransactionDate = req.TransactionDate;
+                    ticket.BeneficiaryBank = req?.BeneficiaryBank;
+                    ticket.AccountNumber = req?.AccountNumber;
+                    ticket.MobileNetwork = req?.MobileNetwork;
+                    ticket.BeneficiaryPhoneNumber = req?.BeneficiaryPhoneNumber;
+                    ticket.BillerType = req?.BillerType;
+                    ticket.MultipleTransactions = req?.MultipleTransactions;
+                    ticket.SubRequestType = subRequestType;
+
+                    ticket.Messages = collection;
+
+                    var newTicket = await _requestRepo.AddAsync(ticket);
+                    await unitOfWork.Complete();
+
+                    response = new SubmitMsgResponse
+                    {
+                        Message = "Ticket created successfully",
+                        SubmittedOn = newTicket.CreatedOn.ToString(),
+                        TicketReference = newTicket.TicketReference
+                    };
+
+                    Logger.LogInformation("SubmitMessage Response Complaint Service {@data}", response);
+
+
+                    senderModel.CreatedBy = $"{req.LastName} {req.FirstName}";
+                    if (req.Attachments != null)
+                    {
+                        foreach (var file in req.Attachments)
+                        {
+                            var kafkaAttachment = new Base64Attachment
+                            {
+                                FileBase64 = HelperClass.FileToBase64(file),
+                                FileNameWithExtension = file.FileName
+                            };
+                            yesCenterModel.Base64Attachments.Add(kafkaAttachment);
+                        }
+                    }
+
+                    receipients = _appSettings.YesCenter.Split(",").ToList();
+                    yesCentreEmail = new List<string>();
+                    yesCentreEmail.AddRange(receipients);
+
+                    //var yesCentreEmail = new List<string>
+                    //
+                    //    _appSettings.YesCenter
+                    //
+                    yesCenterModel.Recipients = yesCentreEmail;
+
+                    var senderEmail = new List<string>
+                {
+                    req.Email
+                };
+                    senderModel.Recipients = senderEmail;
+
+                    senderModel.Subject = $"Ticket Reference \"{reference}\" : {reqType.Name}";
+                    senderModel.Title = $"<p>Dear {req.FirstName}</P>";
+                    senderModel.TemplateName = _appSettings.EmailTemplate;
+                    senderModel.Type = NotificationType.Email;
+                    senderModel.Message = $"<p>I hope this email finds you well. We appreciate your patience and want to inform you that we have received your reported issue on VULTe.</p><p>A support ticket: <strong>{newTicket.TicketReference}</strong> has been promptly raised, and our dedicated team is actively working to resolve your concern.</p><p>An assigned agent has been notified and will be treating your case with the utmost priority. If you have any further questions or concerns, please feel free to reach out to our Yes Centre team on 07007652747, 08069880000, 014482100, 012705850.</p><p>Email: yescenter@polarisbanklimited.com</p><p>Thank you for choosing VULTe powered by Polaris Bank Limited.</p>";
+
+                    yesCenterModel.Title = "Yes Center";
+                    yesCenterModel.Subject = $"Ticket Reference \"{reference}\" : {reqType.Name}";
+                    yesCenterModel.TemplateName = _appSettings.YesCenterEmailTemplate;
+                    yesCenterModel.Type = NotificationType.Email;
+                    yesCenterModel.Message = $"<b>{reqType.Name} Request</b> received from <b>{req.FirstName} {req.LastName}</b> on {DateTime.Now} with <b>Ticket Reference: <span style=\"color:#0FC25F\">{reference}</span></b>.<p><b>{reqType.Name}</b> : {req.Message}</p><p><b>Contact Details</b></p>Email address: {req.Email}<p>Phone Number: {req.PhoneNumber}</p>";
+
+                    _notificationService.SendMessage(senderModel.Recipients, senderModel.Message, senderModel.Subject, senderModel.Title, senderModel.AccountNumber, NotificationType.Email);
+                    _producer.ProduceToNotification(senderModel);
+                    _producer.ProduceToNotification(yesCenterModel);
+
+
+
+
+                }
+                if (req.SupportType == SupportType.ScamAlertErronousTransaction || req.SupportType == SupportType.FailedFundsTransfer)
+                {
+                    if (string.IsNullOrEmpty(req.Location))
+                        return ApiResponse<SubmitMsgResponse>.Failed("Location Field is required");
+                    if (!req.Amount.HasValue)
+                        return ApiResponse<SubmitMsgResponse>.Failed("Amount field is required");
+                    if (!req.TransactionDate.HasValue)
+                        return ApiResponse<SubmitMsgResponse>.Failed("Transaction date required");
+                    if (string.IsNullOrEmpty(req.AccountNumber))
+                        return ApiResponse<SubmitMsgResponse>.Failed("Account Number is required");
+                    if (string.IsNullOrEmpty(req.BeneficiaryBank))
+                        return ApiResponse<SubmitMsgResponse>.Failed("Beneficiary bank is required");
+                    var reqType = _subRequestTypeRepo.GetFirstOrDefault(x => x.RequestTypeId == req.RequestTypeId);
+                    var subRequestType = _subRequestTypeRepo.GetFirstOrDefault(x => x.Id == req.SubRequestTypeId);
+
+                    if (reqType == null)
+                        return ApiResponse<SubmitMsgResponse>.Failed("Request type not found, please try again.");
+
+                    if (!reqType.IsActive)
+                        return ApiResponse<SubmitMsgResponse>.Failed("Request type not currently active, please try again.");
+
+                    string reference = await GenerateUniqueTicketReference();
+                    var message = new Message { Sender = req.Email, Title = reqType.Name, MessageBody = req.Message };
+                    var collection = new Collection<Message>
+                {
+                    message
+                };
+                    var ticket = _mapper.Map<Request>(req);
+                    //ticket.Topic = reqType.Name;
+                    ticket.Type = reqType.RequestType;
+                    ticket.Status = RequestStatus.Open;
+                    ticket.TicketReference = reference;
+                    ticket.Location = req.Location;
+                    ticket.Amount = req.Amount;
+                    ticket.TransactionDate = req.TransactionDate;
+                    ticket.BeneficiaryBank = req?.BeneficiaryBank;
+                    ticket.AccountNumber = req?.AccountNumber;
+                    ticket.MobileNetwork = req?.MobileNetwork;
+                    ticket.BeneficiaryPhoneNumber = req?.BeneficiaryPhoneNumber;
+                    ticket.BillerType = req?.BillerType;
+                    ticket.MultipleTransactions = req?.MultipleTransactions;
+                    ticket.SubRequestType = subRequestType;
+
+                    ticket.Messages = collection;
+
+                    var newTicket = await _requestRepo.AddAsync(ticket);
+                    await unitOfWork.Complete();
+
+                    response = new SubmitMsgResponse
+                    {
+                        Message = "Ticket created successfully",
+                        SubmittedOn = newTicket.CreatedOn.ToString(),
+                        TicketReference = newTicket.TicketReference
+                    };
+
+                    Logger.LogInformation("SubmitMessage Response Complaint Service {@data}", response);
+
+
+                    senderModel.CreatedBy = $"{req.LastName} {req.FirstName}";
+                    if (req.Attachments != null)
+                    {
+                        foreach (var file in req.Attachments)
+                        {
+                            var kafkaAttachment = new Base64Attachment
+                            {
+                                FileBase64 = HelperClass.FileToBase64(file),
+                                FileNameWithExtension = file.FileName
+                            };
+                            yesCenterModel.Base64Attachments.Add(kafkaAttachment);
+                        }
+                    }
+
+                    receipients = _appSettings.YesCenter.Split(",").ToList();
+                    yesCentreEmail = new List<string>();
+                    yesCentreEmail.AddRange(receipients);
+
+                    //var yesCentreEmail = new List<string>
+                    //
+                    //    _appSettings.YesCenter
+                    //
+                    yesCenterModel.Recipients = yesCentreEmail;
+
+                    var senderEmail = new List<string>
+                {
+                    req.Email
+                };
+                    senderModel.Recipients = senderEmail;
+
+                    senderModel.Subject = $"Ticket Reference \"{reference}\" : {reqType.Name}";
+                    senderModel.Title = $"<p>Dear {req.FirstName}</P>";
+                    senderModel.TemplateName = _appSettings.EmailTemplate;
+                    senderModel.Type = NotificationType.Email;
+                    senderModel.Message = $"<p>I hope this email finds you well. We appreciate your patience and want to inform you that we have received your reported issue on VULTe.</p><p>A support ticket: <strong>{newTicket.TicketReference}</strong> has been promptly raised, and our dedicated team is actively working to resolve your concern.</p><p>An assigned agent has been notified and will be treating your case with the utmost priority. If you have any further questions or concerns, please feel free to reach out to our Yes Centre team on 07007652747, 08069880000, 014482100, 012705850.</p><p>Email: yescenter@polarisbanklimited.com</p><p>Thank you for choosing VULTe powered by Polaris Bank Limited.</p>";
+
+                    yesCenterModel.Title = "Yes Center";
+                    yesCenterModel.Subject = $"Ticket Reference \"{reference}\" : {reqType.Name}";
+                    yesCenterModel.TemplateName = _appSettings.YesCenterEmailTemplate;
+                    yesCenterModel.Type = NotificationType.Email;
+                    yesCenterModel.Message = $"<b>{reqType.Name} Request</b> received from <b>{req.FirstName} {req.LastName}</b> on {DateTime.Now} with <b>Ticket Reference: <span style=\"color:#0FC25F\">{reference}</span></b>.<p><b>{reqType.Name}</b> : {req.Message}</p><p><b>Contact Details</b></p>Email address: {req.Email}<p>Phone Number: {req.PhoneNumber}</p>";
+
+                    _notificationService.SendMessage(senderModel.Recipients, senderModel.Message, senderModel.Subject, senderModel.Title, senderModel.AccountNumber, NotificationType.Email);
+                    _producer.ProduceToNotification(senderModel);
+                    _producer.ProduceToNotification(yesCenterModel);
+
+
+
+
+                }
+
+                if (req.SupportType == SupportType.FailedAirtime)
+                {
+                    if (string.IsNullOrEmpty(req.Location))
+                        return ApiResponse<SubmitMsgResponse>.Failed("Location Field is required");
+                    if (!req.Amount.HasValue)
+                        return ApiResponse<SubmitMsgResponse>.Failed("Amount field is required");
+                    if (!req.TransactionDate.HasValue)
+                        return ApiResponse<SubmitMsgResponse>.Failed("Transaction date required");
+                    if (string.IsNullOrEmpty(req.MobileNetwork))
+                        return ApiResponse<SubmitMsgResponse>.Failed("Mobile Network not selected");
+                    if (string.IsNullOrEmpty(req.BeneficiaryPhoneNumber))
+                        return ApiResponse<SubmitMsgResponse>.Failed("Beneficiary Phone Number Missing");
+
+                    var reqType =  _subRequestTypeRepo.GetFirstOrDefault(x => x.RequestTypeId == req.RequestTypeId);
+                    var subRequestType = _subRequestTypeRepo.GetFirstOrDefault  (x => x.Id == req.SubRequestTypeId);
+
+                    if (reqType == null)
+                        return ApiResponse<SubmitMsgResponse>.Failed("Request type not found, please try again.");
+
+                    if (!reqType.IsActive)
+                        return ApiResponse<SubmitMsgResponse>.Failed("Request type not currently active, please try again.");
+
+                    string reference = await GenerateUniqueTicketReference();
+                    var message = new Message { Sender = req.Email, Title = reqType.Name, MessageBody = req.Message };
+                    var collection = new Collection<Message>
+                {
+                    message
+                };
+                    var ticket = _mapper.Map<Request>(req);
+                    //ticket.Topic = reqType.Name;
+                    ticket.Type = reqType.RequestType;
+                    ticket.Status = RequestStatus.Open;
+                    ticket.TicketReference = reference;
+                    ticket.Location = req.Location;
+                    ticket.Amount = req.Amount;
+                    ticket.TransactionDate = req.TransactionDate;
+                    ticket.BeneficiaryBank = req?.BeneficiaryBank;
+                    ticket.AccountNumber = req?.AccountNumber;
+                    ticket.MobileNetwork = req?.MobileNetwork;
+                    ticket.BeneficiaryPhoneNumber = req?.BeneficiaryPhoneNumber;
+                    ticket.BillerType = req?.BillerType;
+                    ticket.MultipleTransactions = req?.MultipleTransactions;
+                    ticket.SubRequestType = subRequestType;
+
+                    ticket.Messages = collection;
+
+                    var newTicket = await _requestRepo.AddAsync(ticket);
+                    await unitOfWork.Complete();
+
+                    response = new SubmitMsgResponse
+                    {
+                        Message = "Ticket created successfully",
+                        SubmittedOn = newTicket.CreatedOn.ToString(),
+                        TicketReference = newTicket.TicketReference
+                    };
+
+                    Logger.LogInformation("SubmitMessage Response Complaint Service {@data}", response);
+
+
+                    senderModel.CreatedBy = $"{req.LastName} {req.FirstName}";
+                    if (req.Attachments != null)
+                    {
+                        foreach (var file in req.Attachments)
+                        {
+                            var kafkaAttachment = new Base64Attachment
+                            {
+                                FileBase64 = HelperClass.FileToBase64(file),
+                                FileNameWithExtension = file.FileName
+                            };
+                            yesCenterModel.Base64Attachments.Add(kafkaAttachment);
+                        }
+                    }
+
+                    receipients = _appSettings.YesCenter.Split(",").ToList();
+                    yesCentreEmail = new List<string>();
+                    yesCentreEmail.AddRange(receipients);
+
+                    //var yesCentreEmail = new List<string>
+                    //
+                    //    _appSettings.YesCenter
+                    //
+                    yesCenterModel.Recipients = yesCentreEmail;
+
+                    var senderEmail = new List<string>
+                {
+                    req.Email
+                };
+                    senderModel.Recipients = senderEmail;
+
+                    senderModel.Subject = $"Ticket Reference \"{reference}\" : {reqType.Name}";
+                    senderModel.Title = $"<p>Dear {req.FirstName}</P>";
+                    senderModel.TemplateName = _appSettings.EmailTemplate;
+                    senderModel.Type = NotificationType.Email;
+                    senderModel.Message = $"<p>I hope this email finds you well. We appreciate your patience and want to inform you that we have received your reported issue on VULTe.</p><p>A support ticket: <strong>{newTicket.TicketReference}</strong> has been promptly raised, and our dedicated team is actively working to resolve your concern.</p><p>An assigned agent has been notified and will be treating your case with the utmost priority. If you have any further questions or concerns, please feel free to reach out to our Yes Centre team on 07007652747, 08069880000, 014482100, 012705850.</p><p>Email: yescenter@polarisbanklimited.com</p><p>Thank you for choosing VULTe powered by Polaris Bank Limited.</p>";
+
+                    yesCenterModel.Title = "Yes Center";
+                    yesCenterModel.Subject = $"Ticket Reference \"{reference}\" : {reqType.Name}";
+                    yesCenterModel.TemplateName = _appSettings.YesCenterEmailTemplate;
+                    yesCenterModel.Type = NotificationType.Email;
+                    yesCenterModel.Message = $"<b>{reqType.Name} Request</b> received from <b>{req.FirstName} {req.LastName}</b> on {DateTime.Now} with <b>Ticket Reference: <span style=\"color:#0FC25F\">{reference}</span></b>.<p><b>{reqType.Name}</b> : {req.Message}</p><p><b>Contact Details</b></p>Email address: {req.Email}<p>Phone Number: {req.PhoneNumber}</p>";
+
+                    _notificationService.SendMessage(senderModel.Recipients, senderModel.Message, senderModel.Subject, senderModel.Title, senderModel.AccountNumber, NotificationType.Email);
+                    _producer.ProduceToNotification(senderModel);
+                    _producer.ProduceToNotification(yesCenterModel);
+
+
+
+
+                }
+
+                if (req.SupportType == SupportType.FailedBillPayment)
+                {
+                    if (string.IsNullOrEmpty(req.Location))
+                        return ApiResponse<SubmitMsgResponse>.Failed("Location Field is required");
+                    if (!req.Amount.HasValue)
+                        return ApiResponse<SubmitMsgResponse>.Failed("Amount field is required");
+                    if (!req.TransactionDate.HasValue)
+                        return ApiResponse<SubmitMsgResponse>.Failed("Transaction date required");
+                    if (string.IsNullOrEmpty(req.BillerType))
+                        return ApiResponse<SubmitMsgResponse>.Failed("Biller Types is not selected");
+                    if (string.IsNullOrEmpty(req.BeneficiaryPhoneNumber))
+                        return ApiResponse<SubmitMsgResponse>.Failed("Beneficiary Phone Number Missing");
+
+                    var reqType = _subRequestTypeRepo.GetFirstOrDefault(x => x.RequestTypeId == req.RequestTypeId);
+                    var subRequestType = _subRequestTypeRepo.GetFirstOrDefault(x => x.Id == req.SubRequestTypeId);
+
+                    if (reqType == null)
+                        return ApiResponse<SubmitMsgResponse>.Failed("Request type not found, please try again.");
+
+                    if (!reqType.IsActive)
+                        return ApiResponse<SubmitMsgResponse>.Failed("Request type not currently active, please try again.");
+
+                    string reference = await GenerateUniqueTicketReference();
+                    var message = new Message { Sender = req.Email, Title = reqType.Name, MessageBody = req.Message };
+                    var collection = new Collection<Message>
+                {
+                    message
+                };
+                    var ticket = _mapper.Map<Request>(req);
+                    //ticket.Topic = reqType.Name;
+                    ticket.Type = reqType.RequestType;
+                    ticket.Status = RequestStatus.Open;
+                    ticket.TicketReference = reference;
+                    ticket.Location = req.Location;
+                    ticket.Amount = req.Amount;
+                    ticket.TransactionDate = req.TransactionDate;
+                    ticket.BeneficiaryBank = req?.BeneficiaryBank;
+                    ticket.AccountNumber = req?.AccountNumber;
+                    ticket.MobileNetwork = req?.MobileNetwork;
+                    ticket.BeneficiaryPhoneNumber = req?.BeneficiaryPhoneNumber;
+                    ticket.BillerType = req?.BillerType;
+                    ticket.MultipleTransactions = req?.MultipleTransactions;
+                    ticket.SubRequestType = subRequestType;
+
+                    ticket.Messages = collection;
+
+                    var newTicket = await _requestRepo.AddAsync(ticket);
+                    await unitOfWork.Complete();
+
+                    response = new SubmitMsgResponse
+                    {
+                        Message = "Ticket created successfully",
+                        SubmittedOn = newTicket.CreatedOn.ToString(),
+                        TicketReference = newTicket.TicketReference
+                    };
+
+                    Logger.LogInformation("SubmitMessage Response Complaint Service {@data}", response);
+
+
+                    senderModel.CreatedBy = $"{req.LastName} {req.FirstName}";
+                    if (req.Attachments != null)
+                    {
+                        foreach (var file in req.Attachments)
+                        {
+                            var kafkaAttachment = new Base64Attachment
+                            {
+                                FileBase64 = HelperClass.FileToBase64(file),
+                                FileNameWithExtension = file.FileName
+                            };
+                            yesCenterModel.Base64Attachments.Add(kafkaAttachment);
+                        }
+                    }
+
+                    receipients = _appSettings.YesCenter.Split(",").ToList();
+                    yesCentreEmail = new List<string>();
+                    yesCentreEmail.AddRange(receipients);
+
+                    //var yesCentreEmail = new List<string>
+                    //
+                    //    _appSettings.YesCenter
+                    //
+                    yesCenterModel.Recipients = yesCentreEmail;
+
+                    var senderEmail = new List<string>
+                {
+                    req.Email
+                };
+                    senderModel.Recipients = senderEmail;
+
+                    //var msgggg =
+
+                    senderModel.Subject = $"Ticket Reference \"{reference}\" : {reqType.Name}";
+                    senderModel.Title = $"<p>Dear {req.FirstName}</P>";
+                    senderModel.TemplateName = _appSettings.EmailTemplate;
+                    senderModel.Type = NotificationType.Email;
+                    senderModel.Message = $"<p>I hope this email finds you well. We appreciate your patience and want to inform you that we have received your reported issue on VULTe.</p><p>A support ticket: <strong>{newTicket.TicketReference}</strong> has been promptly raised, and our dedicated team is actively working to resolve your concern.</p><p>An assigned agent has been notified and will be treating your case with the utmost priority. If you have any further questions or concerns, please feel free to reach out to our Yes Centre team on 07007652747, 08069880000, 014482100, 012705850.</p><p>Email: yescenter@polarisbanklimited.com</p><p>Thank you for choosing VULTe powered by Polaris Bank Limited.</p>";
+
+                    yesCenterModel.Title = "Yes Center";
+                    yesCenterModel.Subject = $"Ticket Reference \"{reference}\" : {reqType.Name}";
+                    yesCenterModel.TemplateName = _appSettings.YesCenterEmailTemplate;
+                    yesCenterModel.Type = NotificationType.Email;
+                    yesCenterModel.Message = $"<b>{reqType.Name} Request</b> received from <b>{req.FirstName} {req.LastName}</b> on {DateTime.Now} with <b>Ticket Reference: <span style=\"color:#0FC25F\">{reference}</span></b>.<p><b>{reqType.Name}</b> : {req.Message}</p><p><b>Contact Details</b></p>Email address: {req.Email}<p>Phone Number: {req.PhoneNumber}</p>";
+
+                    _notificationService.SendMessage(senderModel.Recipients, senderModel.Message, senderModel.Subject, senderModel.Title, senderModel.AccountNumber, NotificationType.Email);
+                    _producer.ProduceToNotification(senderModel);
+                    _producer.ProduceToNotification(yesCenterModel);
+
+
+
+
+                }
+
+
+
+                er.Result = response;
+                return er;
+
+
+
+
+            }
+            catch (Exception ex)
+            {
+                er.Message = "service error, please try again";
+                er.Response = ApiResponseCodes.Exception;
+                Logger.LogError(ex, "Error occurred while submitting message {@data}", ex);
+                return er;
+            }
+        }
+
+        public ApiResponse<ComplaintResponse> GetResolutionStatus(string Id)
+        {
+            var er = new ApiResponse<ComplaintResponse>();
+
+            try
+            {
+                var result = _requestRepo.Includes(x => x.Messages).Where(x => x.TicketReference == Id).FirstOrDefault();
+
+                if (result == null)
+                {
+                    return ApiResponse<ComplaintResponse>.Failed($"Request with ticket reference {Id} not found");
+                }
+
+                er.Result = _mapper.Map<ComplaintResponse>(result);
+            }
+            catch (Exception ex)
+            {
+                Logger.LogError(ex, "Error occurred while getting resolution status {@data}", ex);
+                return ApiResponse<ComplaintResponse>.Failed("Error occurred while getting resolution status");
+            }
+
+            return er;
+        }
+    }
+}
